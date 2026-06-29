@@ -1,0 +1,73 @@
+#!/bin/bash
+#
+# pft-rank - Post Fiat (PFT) wallet leaderboard rank checker
+#
+# Walks the entire Post Fiat ledger via the public ledger_data RPC endpoint and
+# prints the top 30 holders, a "neighborhood" view of the 5 ranks above and
+# below the target wallet, and that wallet's balance plus overall and earner rank.
+#
+# Usage:
+#   pft-rank <WALLET_ADDRESS>
+#
+# Example:
+#   pft-rank r4XLZKYK63z4zW8ttKzgy8NVW1Noa1pRwj
+#
+# Requirements: bash, curl, jq, awk, sort  (all standard on Linux/macOS except jq)
+#   Install jq:  Debian/Ubuntu -> sudo apt install jq   |   macOS -> brew install jq
+#
+# No API key, wallet secret, or login required. Read-only public data.
+
+set -euo pipefail
+
+WALLET="${1:-}"
+if [ -z "$WALLET" ]; then
+  echo "Usage: pft-rank <WALLET_ADDRESS>"
+  echo "Example: pft-rank r4XLZKYK63z4zW8ttKzgy8NVW1Noa1pRwj"
+  exit 1
+fi
+
+RPC="${PFT_RPC_URL:-https://rpc.testnet.postfiat.org}"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT"' EXIT
+
+# Walk the full account set, 400 entries per page, following the RPC marker.
+MARKER=""
+while :; do
+  if [ -z "$MARKER" ]; then
+    BODY='{"method":"ledger_data","params":[{"binary":false,"type":"account","limit":400}]}'
+  else
+    BODY="{\"method\":\"ledger_data\",\"params\":[{\"binary\":false,\"type\":\"account\",\"limit\":400,\"marker\":\"$MARKER\"}]}"
+  fi
+  RESP=$(curl -s -X POST "$RPC" -H "Content-Type: application/json" -d "$BODY")
+  echo "$RESP" | jq -r '.result.state[] | "\(.Balance) \(.Account)"' >> "$OUT"
+  MARKER=$(echo "$RESP" | jq -r '.result.marker // empty')
+  [ -z "$MARKER" ] && break
+done
+
+echo "=== Top 30 ==="
+sort -rn "$OUT" | head -30 | awk '{printf "%4d  %15.2f PFT  %s\n", NR, $1/1000000, $2}'
+echo
+
+# Earner ranks exclude the first 12 system/validator wallets at the top.
+EARNER=$(sort -rn "$OUT" | tail -n +13 | grep -n "$WALLET" | awk -F: '{print $1}' || true)
+
+if [ -n "$EARNER" ]; then
+  echo "=== Neighborhood (earner ranks) ==="
+  START=$((EARNER - 5)); [ $START -lt 1 ] && START=1
+  sort -rn "$OUT" | tail -n +13 | awk -v s=$START -v e=$((EARNER + 5)) -v w="$WALLET" \
+    'NR>=s && NR<=e {if ($2==w) printf "\033[1;32m%4d  %15.2f PFT  %s\033[0m\n", NR, $1/1000000, $2; else printf "%4d  %15.2f PFT  %s\n", NR, $1/1000000, $2}'
+  echo
+fi
+
+echo "=== Wallet ==="
+TOTAL=$(wc -l < "$OUT")
+OVERALL=$(sort -rn "$OUT" | grep -n "$WALLET" | awk -F: '{print $1}' || true)
+if [ -z "$OVERALL" ]; then
+  echo "Wallet $WALLET not found in the ledger account set."
+  exit 0
+fi
+BAL=$(grep "$WALLET" "$OUT" | awk '{printf "%.2f", $1/1000000}')
+echo "Address:      $WALLET"
+echo "Balance:      $BAL PFT"
+echo "Overall rank: #$OVERALL of $TOTAL accounts"
+[ -n "$EARNER" ] && echo "Earner rank:  #$EARNER (excluding 12 system/validator wallets)"
